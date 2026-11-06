@@ -7,6 +7,7 @@ namespace Quansitech\Cmf\Media\Flysystem;
 use Overtrue\Flysystem\Cos\CosAdapter;
 use Quansitech\Cmf\Media\Cdn\CdnAuthSigner;
 use Quansitech\Cmf\Media\Cdn\CdnSignerFactory;
+use Quansitech\Cmf\Media\Support\MediaManager;
 
 /**
  * COS + CDN 加速域名访问适配器。
@@ -23,6 +24,9 @@ class CosCdnAdapter extends CosAdapter
 
     private bool $cdnSignerResolved = false;
 
+    /** 构造期归一后的回源子目录前缀（无首尾斜杠；空 = CDN 关联桶根） */
+    private readonly string $cdnPathPrefix;
+
     public function __construct(array $config)
     {
         parent::__construct($config);
@@ -35,6 +39,7 @@ class CosCdnAdapter extends CosAdapter
             throw new \InvalidArgumentException('CosCdnAdapter 已启用（cdn.auth_type 已配置）但 cdn.url 缺失：请配置 disks.cos.cdn.url（CDN 加速域名），或移除 auth_type 以使用原生 COS 访问');
         }
 
+        $this->cdnPathPrefix = MediaManager::normalizeCdnPathPrefix($this->config['cdn']['path_prefix'] ?? '');
         $this->cdnSigner();
     }
 
@@ -48,7 +53,9 @@ class CosCdnAdapter extends CosAdapter
             throw new \InvalidArgumentException('CosCdnAdapter 已启用（cdn.auth_type 已配置）但 cdn.url 缺失：请配置 disks.cos.cdn.url（CDN 加速域名），或移除 auth_type 以使用原生 COS 访问');
         }
 
-        $uri = '/'.$this->prefixer->prefixPath($path);
+        // 剥前缀后的 uri 同时用于签名与拼接——两处必须同源，剥其一必致
+        // 404（双重前缀）或 403（边缘按 URL Path 复算 md5 失败）
+        $uri = $this->stripPathPrefix('/'.$this->prefixer->prefixPath($path));
         $signer = $this->cdnSigner();
 
         return $signer instanceof CdnAuthSigner
@@ -70,6 +77,25 @@ class CosCdnAdapter extends CosAdapter
         }
 
         return $this->getUrl($path);
+    }
+
+    /**
+     * 剥掉 CDN 关联子目录前缀（完整目录段：/{prefix}/ 开头；uri 恰等于
+     * /{prefix} 不算命中）。path 不在前缀之下即抛——该对象不在 CDN 关联
+     * 目录内，边缘回源必 404，不应静默输出错误 URL。
+     */
+    private function stripPathPrefix(string $uri): string
+    {
+        if ($this->cdnPathPrefix === '') {
+            return $uri;
+        }
+
+        $needle = '/'.$this->cdnPathPrefix.'/';
+        if (str_starts_with($uri, $needle)) {
+            return substr($uri, strlen($needle) - 1);
+        }
+
+        throw new \InvalidArgumentException("对象 {$uri} 不在 CDN 关联目录 {$this->cdnPathPrefix}/ 之下：CDN 边缘回源无法命中（404）。请核对 COS_CDN_PATH_PREFIX 与控制台「回源源路径」，或修正对象存放路径");
     }
 
     private function cdnSigner(): ?CdnAuthSigner

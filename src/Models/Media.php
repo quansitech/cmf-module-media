@@ -9,9 +9,13 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Foundation\Auth\User;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\ValidationException;
 use Quansitech\Cmf\Media\Jobs\DeleteMediaJob;
+use Quansitech\Cmf\Media\Support\MediaManager;
 use Quansitech\Cmf\Media\Support\UploadRule;
 use Throwable;
 
@@ -95,6 +99,31 @@ class Media extends Model
     }
 
     /**
+     * 启用 CDN 子目录关联（cdn.path_prefix）时，对象必须落在该目录下，否则边缘
+     * 必然 404。上传期就拒绝，避免脏对象进库后成片空白；空前缀（默认）不校验。
+     */
+    public static function assertKeyWithinCdnPrefix(string $key, string $driver): void
+    {
+        $cdn = config('filesystems.disks.'.self::diskName($driver).'.cdn');
+
+        // 与 adapter 的启用条件同源：CDN 出口未启用时 url() 走原生全 Key，
+        // 前缀不参与拼接，桶根对象照常可用，不应拒绝上传
+        if (! is_array($cdn) || ! MediaManager::cdnEnabled($cdn)) {
+            return;
+        }
+
+        $prefix = MediaManager::normalizeCdnPathPrefix($cdn['path_prefix'] ?? '');
+
+        if ($prefix === '' || str_starts_with($key, $prefix.'/')) {
+            return;
+        }
+
+        throw ValidationException::withMessages([
+            'path' => "对象落点 {$key} 不在 CDN 子目录 {$prefix}/ 下：检查该入口规则的 path，或清空 COS_CDN_PATH_PREFIX",
+        ]);
+    }
+
+    /**
      * @return HasMany<MediaUsage, $this>
      */
     public function usages(): HasMany
@@ -110,7 +139,7 @@ class Media extends Model
     public function uploader(): BelongsTo
     {
         /** @var class-string<Model> $model */
-        $model = config('auth.providers.users.model') ?: \Illuminate\Foundation\Auth\User::class;
+        $model = config('auth.providers.users.model') ?: User::class;
 
         return $this->belongsTo($model, 'uploader_id');
     }
@@ -129,22 +158,65 @@ class Media extends Model
      */
     public function url(int $ttl = 600): ?string
     {
+        $diskName = static::diskName($this->disk);
+
         try {
-            $disk = Storage::disk(static::diskName($this->disk));
-        } catch (Throwable) {
-            // 对应驱动的 adapter 未安装时，列表页等展示场景不因此 500
+            $disk = Storage::disk($diskName);
+        } catch (Throwable $error) {
+            if (config("filesystems.disks.{$diskName}") !== null) {
+                $this->logUrlFailure($diskName, [$error], [
+                    'media_id' => $this->id,
+                    'disk' => $this->disk,
+                    'path' => $this->path,
+                    'exception' => $error,
+                ]);
+            }
+
             return null;
         }
 
         try {
             return $disk->url($this->path);
-        } catch (Throwable) {
+        } catch (Throwable $urlError) {
             try {
                 return $disk->temporaryUrl($this->path, now()->addSeconds($ttl));
-            } catch (Throwable) {
+            } catch (Throwable $temporaryError) {
+                $this->logUrlFailure($diskName, [$urlError, $temporaryError], [
+                    'media_id' => $this->id,
+                    'disk' => $this->disk,
+                    'path' => $this->path,
+                    'exception' => $urlError,
+                    'temporary_url_exception' => $temporaryError,
+                ]);
+
                 return null;
             }
         }
+    }
+
+    /**
+     * 同一 disk 上按根因（异常类型 + 消息指纹）各记一条；去重状态存容器，
+     * Web 每请求复位，队列/CLI 下随进程存活。
+     *
+     * @param  list<Throwable>  $errors
+     * @param  array<string, mixed>  $context
+     */
+    private function logUrlFailure(string $diskName, array $errors, array $context): void
+    {
+        $reason = implode('/', array_map(
+            fn (Throwable $error): string => $error::class.':'.substr(md5($error->getMessage()), 0, 8),
+            $errors
+        ));
+
+        $marker = "cmf-media.url-failure.{$diskName}.{$reason}";
+
+        if (app()->bound($marker)) {
+            return;
+        }
+
+        app()->instance($marker, true);
+
+        Log::warning('媒体 URL 生成失败，已退化为 null', $context);
     }
 
     /**
